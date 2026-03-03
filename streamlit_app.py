@@ -130,11 +130,22 @@ with col_der:
     if uploaded_file is not None:
         # Leer la imagen
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)  # Lee con todos los canales
         if image is None:
             st.error("❌ No se pudo leer la imagen. Intenta con otro archivo.")
             st.stop()
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Convertir a RGB de 3 canales (maneja diferentes formatos)
+        if len(image.shape) == 2:  # escala de grises
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.shape[2] == 4:  # RGBA
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+        else:  # asumimos BGR de 3 canales
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Mostrar información de depuración (puedes eliminar esta línea después de verificar)
+        st.write(f"Forma de la imagen: {image_rgb.shape}, tipo: {image_rgb.dtype}")
+
         st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
 
         if predecir_btn:
@@ -183,7 +194,6 @@ with col_der:
                     st.error(traceback.format_exc())
     else:
         st.info("👈 Sube una imagen para comenzar.")
-
 # ------------------------------------------------------------------
 # 5. Pie de página
 # ------------------------------------------------------------------
