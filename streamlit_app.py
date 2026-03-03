@@ -124,29 +124,43 @@ with col_izq:
     edad = st.number_input("Edad materna", min_value=18, max_value=50, value=30, step=1)
     ha = st.selectbox("Latido fetal (HA)", options=[0, 1], format_func=lambda x: "Sí (1)" if x == 1 else "No (0)")
     predecir_btn = st.button("🔍 Predecir", type="primary", use_container_width=True)
-
 with col_der:
     st.subheader("📊 Resultados")
     if uploaded_file is not None:
-        # Leer la imagen
+        # Leer imagen
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)  # Lee con todos los canales
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
         if image is None:
             st.error("❌ No se pudo leer la imagen. Intenta con otro archivo.")
             st.stop()
 
-        # Convertir a RGB de 3 canales (maneja diferentes formatos)
-        if len(image.shape) == 2:  # escala de grises
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.shape[2] == 4:  # RGBA
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
-        else:  # asumimos BGR de 3 canales
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # Depuración: mostrar información de la imagen original
+        st.write(f"**Depuración - imagen original:** tipo={type(image)}, shape={image.shape}, dtype={image.dtype}")
 
-        # Mostrar información de depuración (puedes eliminar esta línea después de verificar)
-        st.write(f"Forma de la imagen: {image_rgb.shape}, tipo: {image_rgb.dtype}")
+        # Convertir a RGB de 3 canales
+        try:
+            if len(image.shape) == 2:  # escala de grises
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            elif image.shape[2] == 4:  # RGBA
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+            else:  # asumimos BGR de 3 canales
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            st.write(f"**Depuración - imagen convertida:** shape={image_rgb.shape}, dtype={image_rgb.dtype}")
+        except Exception as e:
+            st.error(f"Error en conversión: {e}")
+            st.stop()
 
-        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+        # Asegurar tipo uint8
+        if image_rgb.dtype != np.uint8:
+            image_rgb = image_rgb.astype(np.uint8)
+            st.write("**Depuración:** convertido a uint8")
+
+        # Mostrar imagen con manejo de error
+        try:
+            st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+        except Exception as e:
+            st.error(f"Error al mostrar imagen: {e}")
+            st.stop()
 
         if predecir_btn:
             with st.spinner("Procesando imagen y calculando..."):
@@ -194,6 +208,37 @@ with col_der:
                     st.error(traceback.format_exc())
     else:
         st.info("👈 Sube una imagen para comenzar.")
+
+        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+
+        if predecir_btn:
+            with st.spinner("Procesando imagen y calculando..."):
+                try:
+                    # Preprocesar imagen
+                    img_tensor = transform(image_rgb).unsqueeze(0).to(device)
+
+                    # --- Predicción de scores Gardner ---
+                    with torch.no_grad():
+                        exp, icm, te = multi_model(img_tensor)
+                        exp_class = exp.argmax(dim=1).item()
+                        icm_class = icm.argmax(dim=1).item()
+                        te_class = te.argmax(dim=1).item()
+
+                    # --- Extracción de características del backbone ---
+                    with torch.no_grad():
+                        features = backbone(img_tensor).cpu().numpy().flatten()
+
+                    # --- Preparar datos clínicos escalados ---
+                    clin_data = np.array([[edad, ha]], dtype=np.float32)
+                    clin_scaled = scaler.transform(clin_data).flatten()
+
+                    # --- Concatenar y predecir LB ---
+                    combined_input = np.concatenate([features, clin_scaled])
+                    combined_tensor = torch.tensor(combined_input, dtype=torch.float32).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        logit = combined_model(combined_tensor)
+                        prob_lb = torch.sigmoid(logit).item()
+
 # ------------------------------------------------------------------
 # 5. Pie de página
 # ------------------------------------------------------------------
