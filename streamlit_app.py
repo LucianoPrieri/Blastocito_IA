@@ -1,0 +1,181 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+import numpy as np
+import cv2
+import joblib
+import os
+import time
+
+# ------------------------------------------------------------------
+# Definición de los modelos (debe coincidir con el entrenamiento)
+# ------------------------------------------------------------------
+class MultiHeadEfficientNet(nn.Module):
+    def __init__(self, num_exp=5, num_icm=4, num_te=4):
+        super().__init__()
+        self.backbone = models.efficientnet_b0(weights=None)
+        self.backbone.classifier = nn.Identity()
+        num_features = 1280
+        self.fc_exp = nn.Linear(num_features, num_exp)
+        self.fc_icm = nn.Linear(num_features, num_icm)
+        self.fc_te = nn.Linear(num_features, num_te)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_exp(features), self.fc_icm(features), self.fc_te(features)
+
+class CombinedModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(input_dim, 1)
+        )
+
+    def forward(self, x):
+        return self.fc(x).squeeze(1)
+
+# ------------------------------------------------------------------
+# Cargar modelos y escalador (con caché de Streamlit)
+# ------------------------------------------------------------------
+@st.cache_resource
+def load_models():
+    """
+    Carga los modelos, el backbone y el escalador.
+    El decorador @st.cache_resource asegura que solo se carguen una vez y se reutilicen.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Dispositivo: {device}")
+
+    # Transformaciones (mismas que en entrenamiento)
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    # Determinar qué archivos de modelo existen (.safetensors tienen prioridad)
+    if os.path.exists('modelo_multi.safetensors'):
+        from safetensors.torch import load_file
+        multi_weights = load_file('modelo_multi.safetensors')
+        multi_model = MultiHeadEfficientNet().to(device)
+        multi_model.load_state_dict(multi_weights)
+        print("✅ modelo_multi.safetensors cargado")
+    else:
+        multi_model = MultiHeadEfficientNet().to(device)
+        multi_model.load_state_dict(torch.load('modelo_final_blastocyst.pth', map_location=device, weights_only=True))
+        print("✅ modelo_final_blastocyst.pth cargado")
+    multi_model.eval()
+    backbone = multi_model.backbone
+    backbone.eval()
+
+    # Modelo combinado
+    if os.path.exists('modelo_combinado.safetensors'):
+        from safetensors.torch import load_file
+        combined_weights = load_file('modelo_combinado.safetensors')
+        combined_model = CombinedModel(1282).to(device)
+        combined_model.load_state_dict(combined_weights)
+        print("✅ modelo_combinado.safetensors cargado")
+    else:
+        combined_model = CombinedModel(1282).to(device)
+        combined_model.load_state_dict(torch.load('combined_model.pth', map_location=device, weights_only=True))
+        print("✅ combined_model.pth cargado")
+    combined_model.eval()
+
+    # Escalador
+    scaler = joblib.load('scaler.pkl')
+    print("✅ scaler.pkl cargado")
+
+    return multi_model, backbone, combined_model, scaler, transform, device
+
+# ------------------------------------------------------------------
+# Cargar todo al iniciar la aplicación (se ejecuta una sola vez)
+# ------------------------------------------------------------------
+multi_model, backbone, combined_model, scaler, transform, device = load_models()
+
+# ------------------------------------------------------------------
+# Interfaz de Streamlit
+# ------------------------------------------------------------------
+st.set_page_config(page_title="Blastocisto IA", page_icon="🧬", layout="wide")
+
+st.title("🧬 Blastocisto IA")
+st.markdown("""
+Esta aplicación predice los **scores Gardner** (EXP, ICM, TE) y la **probabilidad de nacido vivo (LB)**  
+a partir de una imagen de blastocisto (día 5) y datos clínicos (edad materna y latido fetal HA).
+""")
+
+# Crear columnas para organizar la entrada y la salida
+col_izq, col_der = st.columns([1, 1], gap="large")
+
+with col_izq:
+    st.subheader("📤 Imagen y datos clínicos")
+    uploaded_file = st.file_uploader("Selecciona una imagen PNG o JPG", type=["png", "jpg", "jpeg"])
+    edad = st.number_input("Edad materna", min_value=18, max_value=50, value=30, step=1)
+    ha = st.selectbox("Latido fetal (HA)", options=[0, 1], format_func=lambda x: "Sí (1)" if x == 1 else "No (0)")
+    predecir_btn = st.button("🔍 Predecir", type="primary", use_container_width=True)
+
+with col_der:
+    st.subheader("📊 Resultados")
+    if uploaded_file is not None:
+        # Leer la imagen
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+
+        if predecir_btn:
+            with st.spinner("Procesando imagen y calculando..."):
+                # Preprocesar imagen
+                img_tensor = transform(image_rgb).unsqueeze(0).to(device)
+
+                # --- Predicción de scores Gardner ---
+                with torch.no_grad():
+                    exp, icm, te = multi_model(img_tensor)
+                    exp_class = exp.argmax(dim=1).item()
+                    icm_class = icm.argmax(dim=1).item()
+                    te_class = te.argmax(dim=1).item()
+
+                # --- Extracción de características del backbone ---
+                with torch.no_grad():
+                    features = backbone(img_tensor).cpu().numpy().flatten()
+
+                # --- Preparar datos clínicos escalados ---
+                clin_data = np.array([[edad, ha]], dtype=np.float32)
+                clin_scaled = scaler.transform(clin_data).flatten()
+
+                # --- Concatenar y predecir LB ---
+                combined_input = np.concatenate([features, clin_scaled])
+                combined_tensor = torch.tensor(combined_input, dtype=torch.float32).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    logit = combined_model(combined_tensor)
+                    prob_lb = torch.sigmoid(logit).item()
+
+                # --- Mostrar resultados en columnas ---
+                col_res1, col_res2, col_res3, col_res4 = st.columns(4)
+                col_res1.metric("EXP", exp_class)
+                col_res2.metric("ICM", icm_class)
+                col_res3.metric("TE", te_class)
+                col_res4.metric("Prob. LB", f"{prob_lb:.1%}")
+
+                # Interpretación
+                if prob_lb > 0.5:
+                    st.success(f"✅ Probabilidad de nacido vivo: **{prob_lb:.1%}**")
+                else:
+                    st.warning(f"⚠️ Probabilidad de nacido vivo: **{prob_lb:.1%}**")
+    else:
+        st.info("👈 Sube una imagen para comenzar.")
+
+# ------------------------------------------------------------------
+# Pie de página con información adicional
+# ------------------------------------------------------------------
+st.markdown("---")
+st.markdown("""
+**Notas:**
+- **EXP**: 0‑4, **ICM** y **TE**: 0‑2 (según sistema Gardner modificado).
+- **HA**: 0 = sin latido fetal, 1 = con latido fetal.
+- El modelo de imagen se basa en EfficientNet‑B0 entrenado con más de 2000 anotaciones.
+- La probabilidad de LB combina características de imagen + edad + HA.
+""")
