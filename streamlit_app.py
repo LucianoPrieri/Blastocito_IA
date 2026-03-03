@@ -10,12 +10,12 @@ import sys
 import traceback
 
 # ------------------------------------------------------------------
-# Configuración de la página (debe ser lo primero)
+# 1. Configuración de la página (DEBE SER LO PRIMERO)
 # ------------------------------------------------------------------
 st.set_page_config(page_title="Blastocisto IA", page_icon="🧬", layout="wide")
 
 # ------------------------------------------------------------------
-# Definición de los modelos (debe coincidir con el entrenamiento)
+# 2. Definición de los modelos (igual que en el entrenamiento)
 # ------------------------------------------------------------------
 class MultiHeadEfficientNet(nn.Module):
     def __init__(self, num_exp=5, num_icm=4, num_te=4):
@@ -43,18 +43,17 @@ class CombinedModel(nn.Module):
         return self.fc(x).squeeze(1)
 
 # ------------------------------------------------------------------
-# Cargar modelos y escalador (con caché de Streamlit)
+# 3. Carga de modelos con caché (solo prints, sin st.write)
 # ------------------------------------------------------------------
 @st.cache_resource
 def load_models():
     """
     Carga los modelos, el backbone y el escalador.
-    El decorador @st.cache_resource asegura que solo se carguen una vez y se reutilicen.
-    Si ocurre algún error, se muestra en la interfaz y se detiene la ejecución.
+    Usa print para logs en consola (no interfiere con st.set_page_config).
     """
     try:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        st.write(f"⚙️ Dispositivo detectado: {device}")
+        print(f"⚙️ Dispositivo detectado: {device}")
 
         # Verificar que los archivos existen
         archivos_necesarios = [
@@ -62,8 +61,7 @@ def load_models():
         ]
         for f in archivos_necesarios:
             if not os.path.exists(f):
-                st.error(f"❌ No se encuentra el archivo: {f}")
-                st.stop()
+                raise FileNotFoundError(f"❌ No se encuentra el archivo: {f}")
 
         # Transformaciones
         transform = transforms.Compose([
@@ -74,15 +72,14 @@ def load_models():
                                  std=[0.229, 0.224, 0.225])
         ])
 
-        # Cargar modelo multi-cabeza (safetensors tiene prioridad)
+        # Cargar modelo multi-cabeza (safetensors)
         from safetensors.torch import load_file
         multi_model = MultiHeadEfficientNet().to(device)
         multi_weights = load_file('modelo_multi.safetensors')
         multi_model.load_state_dict(multi_weights)
         multi_model.eval()
-        st.success("✅ modelo_multi.safetensors cargado correctamente")
+        print("✅ modelo_multi.safetensors cargado")
 
-        # Backbone para extraer características
         backbone = multi_model.backbone
         backbone.eval()
 
@@ -91,21 +88,21 @@ def load_models():
         combined_weights = load_file('modelo_combinado.safetensors')
         combined_model.load_state_dict(combined_weights)
         combined_model.eval()
-        st.success("✅ modelo_combinado.safetensors cargado correctamente")
+        print("✅ modelo_combinado.safetensors cargado")
 
         # Cargar escalador
         scaler = joblib.load('scaler.pkl')
-        st.success("✅ scaler.pkl cargado correctamente")
+        print("✅ scaler.pkl cargado")
 
         return multi_model, backbone, combined_model, scaler, transform, device
 
     except Exception as e:
-        st.error(f"❌ Error al cargar los modelos: {e}")
-        st.error(traceback.format_exc())
-        st.stop()
+        print(f"❌ Error al cargar modelos: {e}")
+        traceback.print_exc()
+        raise e  # Re-lanza para que Streamlit muestre el error
 
 # ------------------------------------------------------------------
-# Interfaz de Streamlit
+# 4. Interfaz de la aplicación
 # ------------------------------------------------------------------
 st.title("🧬 Blastocisto IA")
 st.markdown("""
@@ -113,9 +110,10 @@ Esta aplicación predice los **scores Gardner** (EXP, ICM, TE) y la **probabilid
 a partir de una imagen de blastocisto (día 5) y datos clínicos (edad materna y latido fetal HA).
 """)
 
-# Cargar modelos (solo una vez, con barra de progreso)
+# Cargar modelos (con barra de progreso)
 with st.spinner("Cargando modelos, por favor espera..."):
     multi_model, backbone, combined_model, scaler, transform, device = load_models()
+st.success("✅ Modelos cargados correctamente")
 
 # Crear columnas para organizar la entrada y la salida
 col_izq, col_der = st.columns([1, 1], gap="large")
@@ -187,7 +185,7 @@ with col_der:
         st.info("👈 Sube una imagen para comenzar.")
 
 # ------------------------------------------------------------------
-# Pie de página con información adicional
+# 5. Pie de página
 # ------------------------------------------------------------------
 st.markdown("---")
 st.markdown("""
