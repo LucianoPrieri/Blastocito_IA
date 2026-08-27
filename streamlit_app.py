@@ -122,7 +122,11 @@ with col_der:
         if image_rgb.dtype != np.uint8:
             image_rgb = image_rgb.astype(np.uint8)
 
-        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+                try:
+            st.image(image_rgb, caption="Imagen cargada", use_column_width=True)
+        except Exception as e:
+            st.error(f"Error al mostrar la imagen: {e}")
+            st.stop()
 
         if predecir_btn:
             with st.spinner("Procesando imagen y calculando..."):
