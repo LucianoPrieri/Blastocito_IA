@@ -11,7 +11,7 @@ import traceback
 
 torch.set_num_threads(1)  # evita que torch sature CPU/RAM en el plan gratuito
 
-st.set_page_config(page_title="Blastocisto IA", page_icon="\U0001f9ec", layout="wide")
+st.set_page_config(page_title="Blastocisto IA", page_icon="🧬", layout="wide")
 
 
 class MultiHeadEfficientNet(nn.Module):
@@ -78,7 +78,7 @@ def load_models():
         raise e
 
 
-st.title("\U0001f9ec Blastocisto IA")
+st.title("🧬 Blastocisto IA")
 st.markdown(
     "Esta aplicacion predice los **scores Gardner** (EXP, ICM, TE) y la **probabilidad de nacido vivo (LB)**\n"
     "a partir de una imagen de blastocisto (dia 5) y datos clinicos (edad materna y latido fetal HA)."
@@ -122,7 +122,7 @@ with col_der:
         if image_rgb.dtype != np.uint8:
             image_rgb = image_rgb.astype(np.uint8)
 
-                try:
+        try:
             st.image(image_rgb, caption="Imagen cargada", use_column_width=True)
         except Exception as e:
             st.error(f"Error al mostrar la imagen: {e}")
