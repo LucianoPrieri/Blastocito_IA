@@ -8,6 +8,7 @@ import joblib
 import os
 import gc
 import traceback
+from scipy.spatial.distance import mahalanobis
 
 torch.set_num_threads(1)  # evita que torch sature CPU/RAM en el plan gratuito
 
@@ -38,12 +39,31 @@ class CombinedModel(nn.Module):
         return self.fc(x).squeeze(1)
 
 
+def parece_microscopia(image_rgb):
+    """Filtro estricto: descarta fotos que no son microscopía de blastocisto."""
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    sat_media = hsv[:, :, 1].mean()
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    lado_menor = min(gray.shape[:2])
+    circles = cv2.HoughCircles(
+        cv2.medianBlur(gray, 5), cv2.HOUGH_GRADIENT, dp=1.5,
+        minDist=lado_menor // 2,
+        param1=100, param2=40,
+        minRadius=lado_menor // 5, maxRadius=0,
+    )
+    return sat_media < 60 and circles is not None
+
+
 @st.cache_resource(show_spinner=False)
 def load_models():
     try:
         device = torch.device("cpu")
 
-        archivos_necesarios = ["modelo_multi.safetensors", "modelo_combinado.safetensors", "scaler.pkl"]
+        archivos_necesarios = [
+            "modelo_multi.safetensors", "modelo_combinado.safetensors",
+            "scaler.pkl", "ood_stats.npz"
+        ]
         for f in archivos_necesarios:
             if not os.path.exists(f):
                 raise FileNotFoundError(f"No se encuentra el archivo: {f}")
@@ -69,9 +89,16 @@ def load_models():
         combined_model.eval()
 
         scaler = joblib.load("scaler.pkl")
+
+        ood_data = np.load("ood_stats.npz")
+        ood_centroide = ood_data["centroide"]
+        ood_cov_inv = ood_data["cov_inv"]
+        ood_umbral = float(ood_data["umbral"])
+
         gc.collect()
 
-        return multi_model, backbone, combined_model, scaler, transform, device
+        return (multi_model, backbone, combined_model, scaler, transform, device,
+                ood_centroide, ood_cov_inv, ood_umbral)
 
     except Exception as e:
         traceback.print_exc()
@@ -85,7 +112,8 @@ st.markdown(
 )
 
 with st.spinner("Cargando modelos, por favor espera..."):
-    multi_model, backbone, combined_model, scaler, transform, device = load_models()
+    (multi_model, backbone, combined_model, scaler, transform, device,
+     ood_centroide, ood_cov_inv, ood_umbral) = load_models()
 st.success("Modelos cargados correctamente")
 
 col_izq, col_der = st.columns([1, 1], gap="large")
@@ -128,6 +156,11 @@ with col_der:
             st.error(f"Error al mostrar la imagen: {e}")
             st.stop()
 
+        # BLOQUEO ESTRICTO 1: Filtro visual de microscopía
+        if not parece_microscopia(image_rgb):
+            st.error("❌ **Esto no es un blastocisto.** La imagen cargada no corresponde a una microscopía de embrión válida.")
+            st.stop()
+
         if predecir_btn:
             with st.spinner("Procesando imagen y calculando..."):
                 try:
@@ -139,6 +172,12 @@ with col_der:
                         icm_class = icm.argmax(dim=1).item()
                         te_class = te.argmax(dim=1).item()
                         features = backbone(img_tensor).cpu().numpy().flatten()
+
+                    # BLOQUEO ESTRICTO 2: Distancia Mahalanobis (OOD)
+                    dist_ood = mahalanobis(features, ood_centroide, ood_cov_inv)
+                    if dist_ood > ood_umbral:
+                        st.error("❌ **Esto no es un blastocisto.** La imagen analizada está fuera de los parámetros biológicos esperados.")
+                        st.stop()
 
                     clin_data = np.array([[edad, ha]], dtype=np.float32)
                     clin_scaled = scaler.transform(clin_data).flatten()
@@ -175,5 +214,6 @@ st.markdown(
     "- **EXP**: 0-4, **ICM** y **TE**: 0-2 (segun sistema Gardner modificado).\n"
     "- **HA**: 0 = sin latido fetal, 1 = con latido fetal.\n"
     "- El modelo de imagen se basa en EfficientNet-B0 entrenado con mas de 2000 anotaciones.\n"
-    "- La probabilidad de LB combina caracteristicas de imagen + edad + HA."
+    "- La probabilidad de LB combina caracteristicas de imagen + edad + HA.\n"
+    "- La aplicación bloquea estrictamente imágenes que no corresponden a blastocistos."
 )
