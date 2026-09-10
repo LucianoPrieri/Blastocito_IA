@@ -1,0 +1,10 @@
+streamlit==1.36.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.0+cpu
+torchvision==0.20.0+cpu
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+safetensors==0.4.5
+joblib==1.4.2
+scikit-learn==1.5.2
+scipy==1.13.1
