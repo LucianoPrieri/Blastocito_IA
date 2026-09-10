@@ -179,7 +179,7 @@ with col_der:
         if image_rgb.dtype != np.uint8:
             image_rgb = image_rgb.astype(np.uint8)
 
-        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+        st.image(image_rgb, caption="Imagen cargada", use_column_width=True)
 
         if not parece_microscopia(image_rgb):
             st.warning(
