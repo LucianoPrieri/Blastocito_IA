@@ -102,7 +102,7 @@ def load_models():
 
         scaler = joblib.load("scaler.pkl")  # ajustado sobre [Age, HA], cada columna independiente
 
-        ood_data = np.load("ood_stats.npz")
+        ood_data = np.load("ood_stats.npz", allow_pickle=True)
         ood_centroide = ood_data["centroide"]
         ood_cov_inv = ood_data["cov_inv"]
         ood_umbral = float(ood_data["umbral"])
