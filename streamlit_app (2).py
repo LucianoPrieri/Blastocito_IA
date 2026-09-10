@@ -1,0 +1,270 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+import numpy as np
+import cv2
+import joblib
+import os
+import gc
+import traceback
+from scipy.spatial.distance import mahalanobis
+
+torch.set_num_threads(1)  # evita que torch sature CPU/RAM en el plan gratuito
+
+st.set_page_config(page_title="Blastocisto IA", page_icon="\U0001f9ec", layout="wide")
+
+
+class MultiHeadEfficientNet(nn.Module):
+    def __init__(self, num_exp=5, num_icm=4, num_te=4):
+        super().__init__()
+        self.backbone = models.efficientnet_b0(weights=None)
+        self.backbone.classifier = nn.Identity()
+        num_features = 1280
+        self.fc_exp = nn.Linear(num_features, num_exp)
+        self.fc_icm = nn.Linear(num_features, num_icm)
+        self.fc_te = nn.Linear(num_features, num_te)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_exp(features), self.fc_icm(features), self.fc_te(features)
+
+
+class CombinedModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc = nn.Sequential(nn.Dropout(0.2), nn.Linear(input_dim, 1))
+
+    def forward(self, x):
+        return self.fc(x).squeeze(1)
+
+
+def parece_microscopia(image_rgb):
+    """Filtro barato: descarta fotos que claramente no son microscopía de
+    blastocisto (paisajes, personas, objetos con mucho color, etc.). No es
+    perfecto, es solo una primera barrera antes de gastar cómputo en el modelo."""
+    hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+    sat_media = hsv[:, :, 1].mean()
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    lado_menor = min(gray.shape[:2])
+    circles = cv2.HoughCircles(
+        cv2.medianBlur(gray, 5), cv2.HOUGH_GRADIENT, dp=1.5,
+        minDist=lado_menor // 2,
+        param1=100, param2=40,
+        minRadius=lado_menor // 5, maxRadius=0,
+    )
+
+    return sat_media < 60 and circles is not None
+
+
+@st.cache_resource(show_spinner=False)
+def load_models():
+    try:
+        device = torch.device("cpu")
+
+        archivos_necesarios = [
+            "modelo_multi.safetensors", "modelo_combinado.safetensors",
+            "modelo_combinado_pretransferencia.safetensors",
+            "scaler.pkl", "ood_stats.npz",
+        ]
+        for f in archivos_necesarios:
+            if not os.path.exists(f):
+                raise FileNotFoundError(f"No se encuentra el archivo: {f}")
+
+        transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        from safetensors.torch import load_file
+
+        multi_model = MultiHeadEfficientNet().to(device)
+        multi_model.load_state_dict(load_file("modelo_multi.safetensors"))
+        multi_model.eval()
+
+        backbone = multi_model.backbone
+        backbone.eval()
+
+        # Modelo 'seguimiento': imagen + Age + HA (para consulta POST-transferencia,
+        # cuando el latido fetal ya se pudo haber detectado o no).
+        combined_model = CombinedModel(1282).to(device)
+        combined_model.load_state_dict(load_file("modelo_combinado.safetensors"))
+        combined_model.eval()
+
+        # Modelo 'pre-transferencia': imagen + Age, SIN HA (para decidir qué
+        # embrión transferir, momento en el que el latido todavía no existe).
+        combined_model_pretrans = CombinedModel(1281).to(device)
+        combined_model_pretrans.load_state_dict(load_file("modelo_combinado_pretransferencia.safetensors"))
+        combined_model_pretrans.eval()
+
+        scaler = joblib.load("scaler.pkl")  # ajustado sobre [Age, HA], cada columna independiente
+
+        ood_data = np.load("ood_stats.npz")
+        ood_centroide = ood_data["centroide"]
+        ood_cov_inv = ood_data["cov_inv"]
+        ood_umbral = float(ood_data["umbral"])
+
+        gc.collect()
+
+        return (multi_model, backbone, combined_model, combined_model_pretrans, scaler,
+                transform, device, ood_centroide, ood_cov_inv, ood_umbral)
+
+    except Exception as e:
+        traceback.print_exc()
+        raise e
+
+
+st.title("\U0001f9ec Blastocisto IA")
+st.markdown(
+    "Esta aplicacion predice los **scores Gardner** (EXP, ICM, TE) y la **probabilidad de nacido vivo (LB)**\n"
+    "a partir de una imagen de blastocisto (dia 5). Tiene dos modos, segun el momento clinico:"
+)
+
+with st.spinner("Cargando modelos, por favor espera..."):
+    (multi_model, backbone, combined_model, combined_model_pretrans, scaler,
+     transform, device, ood_centroide, ood_cov_inv, ood_umbral) = load_models()
+st.success("Modelos cargados correctamente")
+
+modo = st.radio(
+    "Modo de uso",
+    options=["Seleccion de embrion (pre-transferencia)", "Seguimiento clinico (post-transferencia)"],
+    help=(
+        "Pre-transferencia: solo imagen + edad materna, para decidir que embrion transferir "
+        "(en ese momento el latido fetal todavia no existe como dato).\n"
+        "Seguimiento: imagen + edad + latido fetal (HA), para una consulta de control varias "
+        "semanas despues de la transferencia, cuando el latido ya se pudo haber detectado o no."
+    ),
+)
+es_pretransferencia = modo.startswith("Seleccion")
+
+col_izq, col_der = st.columns([1, 1], gap="large")
+
+with col_izq:
+    st.subheader("Imagen y datos clinicos")
+    uploaded_file = st.file_uploader("Selecciona una imagen PNG o JPG", type=["png", "jpg", "jpeg"])
+    edad = st.number_input("Edad materna", min_value=18, max_value=50, value=30, step=1)
+    if es_pretransferencia:
+        st.caption("Este modo no pide latido fetal (HA): en el momento de elegir que embrion "
+                   "transferir, ese dato todavia no existe.")
+        ha = None
+    else:
+        ha = st.selectbox("Latido fetal (HA)", options=[0, 1], format_func=lambda x: "Si (1)" if x == 1 else "No (0)")
+    predecir_btn = st.button("Predecir", type="primary", use_container_width=True)
+
+with col_der:
+    st.subheader("Resultados")
+    if uploaded_file is not None:
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+        del file_bytes
+
+        if image is None:
+            st.error("No se pudo leer la imagen. Intenta con otro archivo.")
+            st.stop()
+
+        try:
+            if len(image.shape) == 2:
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            elif image.shape[2] == 4:
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
+            else:
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            st.error(f"Error en conversion de color: {e}")
+            st.stop()
+
+        if image_rgb.dtype != np.uint8:
+            image_rgb = image_rgb.astype(np.uint8)
+
+        st.image(image_rgb, caption="Imagen cargada", use_container_width=True)
+
+        if not parece_microscopia(image_rgb):
+            st.warning(
+                "⚠️ Esta imagen no tiene el aspecto de una foto de microscopia "
+                "de blastocisto (color, forma o contraste inusuales). Se puede "
+                "igual intentar la prediccion, pero el resultado puede no ser confiable."
+            )
+
+        if predecir_btn:
+            with st.spinner("Procesando imagen y calculando..."):
+                try:
+                    img_tensor = transform(image_rgb).unsqueeze(0).to(device)
+
+                    with torch.inference_mode():
+                        exp, icm, te = multi_model(img_tensor)
+                        exp_class = exp.argmax(dim=1).item()
+                        icm_class = icm.argmax(dim=1).item()
+                        te_class = te.argmax(dim=1).item()
+                        features = backbone(img_tensor).cpu().numpy().flatten()
+
+                    dist_ood = mahalanobis(features, ood_centroide, ood_cov_inv)
+                    if dist_ood > ood_umbral:
+                        st.error(
+                            "🚫 Esta imagen no parece corresponder a un blastocisto de dia 5 "
+                            f"(distancia a casos reales: {dist_ood:.1f}, umbral: {ood_umbral:.1f}). "
+                            "No se genera una prediccion para evitar un resultado sin sentido. "
+                            "Proba con una imagen de microscopia de un blastocisto."
+                        )
+                        st.stop()
+
+                    # El scaler fue ajustado sobre [Age, HA] con columnas independientes,
+                    # asi que podemos reusarlo para escalar solo Age (modo pre-transferencia)
+                    # pasando un HA "dummy" que se descarta despues de transformar.
+                    if es_pretransferencia:
+                        clin_scaled_full = scaler.transform(np.array([[edad, 0]], dtype=np.float32)).flatten()
+                        age_scaled = clin_scaled_full[0]
+                        combined_input = np.concatenate([features, [age_scaled]])
+                        modelo_a_usar = combined_model_pretrans
+                    else:
+                        clin_scaled = scaler.transform(np.array([[edad, ha]], dtype=np.float32)).flatten()
+                        combined_input = np.concatenate([features, clin_scaled])
+                        modelo_a_usar = combined_model
+
+                    combined_tensor = torch.tensor(combined_input, dtype=torch.float32).unsqueeze(0).to(device)
+                    with torch.inference_mode():
+                        logit = modelo_a_usar(combined_tensor)
+                        prob_lb = torch.sigmoid(logit).item()
+
+                    col_res1, col_res2, col_res3, col_res4 = st.columns(4)
+                    col_res1.metric("EXP", exp_class)
+                    col_res2.metric("ICM", icm_class)
+                    col_res3.metric("TE", te_class)
+                    col_res4.metric("Prob. LB", f"{prob_lb:.1%}")
+
+                    if prob_lb > 0.5:
+                        st.success(f"Probabilidad de nacido vivo: **{prob_lb:.1%}**")
+                    else:
+                        st.warning(f"Probabilidad de nacido vivo: **{prob_lb:.1%}**")
+
+                    if es_pretransferencia:
+                        st.caption("Calculado con el modelo 'pre-transferencia' (imagen + edad, sin latido fetal).")
+                    else:
+                        st.caption("Calculado con el modelo 'seguimiento' (imagen + edad + latido fetal).")
+
+                    del img_tensor, features, combined_input, combined_tensor
+                    gc.collect()
+
+                except Exception as e:
+                    st.error(f"Error durante la prediccion: {e}")
+                    st.error(traceback.format_exc())
+    else:
+        st.info("Sube una imagen para comenzar.")
+
+st.markdown("---")
+st.markdown(
+    "**Notas:**\n"
+    "- **EXP**: 0-4, **ICM** y **TE**: 0-2 (segun sistema Gardner modificado).\n"
+    "- **HA**: 0 = sin latido fetal, 1 = con latido fetal (solo se usa en el modo Seguimiento).\n"
+    "- El modelo de imagen se basa en EfficientNet-B0 entrenado con mas de 2000 anotaciones.\n"
+    "- **Pre-transferencia** usa imagen + edad (sin HA), para no filtrar informacion que "
+    "todavia no existe en el momento de elegir el embrion a transferir.\n"
+    "- **Seguimiento** usa imagen + edad + HA, pensado para una consulta de control varias "
+    "semanas despues de la transferencia.\n"
+    "- La app filtra imagenes que no parecen microscopia de blastocisto (por forma/color) "
+    "y rechaza aquellas cuyas caracteristicas quedan muy lejos de las imagenes reales de "
+    "entrenamiento (deteccion fuera de dominio / OOD), para evitar predicciones sin sentido "
+    "sobre fotos que no son blastocistos."
+)
